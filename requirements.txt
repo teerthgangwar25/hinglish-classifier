@@ -1,6 +1,8 @@
-# PyTorch is installed separately with the CUDA build from https://pytorch.org/get-started/locally/
+# PyTorch is installed separately (CUDA build) from https://pytorch.org/get-started/locally/
 pandas
 numpy
 scikit-learn
 pytest
 mlflow
+transformers
+accelerate

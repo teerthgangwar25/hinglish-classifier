@@ -3,11 +3,6 @@ Uses train + dev ONLY. The two test sets are not touched here (they are evaluate
 Run from repo root:  python src/train_baseline.py
 View runs:           mlflow ui --backend-store-uri sqlite:///mlflow.db     then open http://127.0.0.1:5000
 """
-import hashlib
-import subprocess
-import tempfile
-from pathlib import Path
-
 import joblib
 import mlflow
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -16,20 +11,10 @@ from sklearn.pipeline import make_pipeline
 
 from evaluate import compute_metrics
 from preprocess import ROOT, clean_text, load_frozen_split
+from thresholds import pick_threshold
+from tracking import data_hash, git_commit, setup_mlflow
 
 C_GRID = [0.3, 1, 3, 10]
-
-
-def git_commit() -> str:
-    try:
-        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, stderr=subprocess.DEVNULL).strip()
-    except Exception:
-        return "unknown"
-
-
-def data_hash() -> str:
-    f = ROOT / "data_checksums.json"
-    return hashlib.sha256(f.read_bytes()).hexdigest()[:16] if f.exists() else "missing"
 
 
 def main() -> None:
@@ -37,12 +22,7 @@ def main() -> None:
     x_train, y_train = train["text"].map(clean_text), train["label"]
     x_dev, y_dev = dev["text"].map(clean_text), dev["label"]
 
-    mlflow.set_tracking_uri(f"sqlite:///{(ROOT / 'mlflow.db').as_posix()}")
-    exp_name = "tfidf-baseline"
-    if mlflow.get_experiment_by_name(exp_name) is None:
-        # as_uri() percent-encodes spaces, so a folder like "Hinglish Offensive-Content Classifier" is safe
-        mlflow.create_experiment(exp_name, artifact_location=(ROOT / "mlruns").as_uri())
-    mlflow.set_experiment(exp_name)
+    setup_mlflow("tfidf-baseline")
 
     best = (-1.0, None, None)
     for C in C_GRID:
@@ -69,9 +49,17 @@ def main() -> None:
     out = ROOT / "models"
     out.mkdir(exist_ok=True)
     joblib.dump(model, out / "tfidf_baseline.joblib")      # models/ is git-ignored
+    # D7: same protocol as every other model: tune the threshold on dev under a 0.90 recall floor
+    p_dev = model.predict_proba(x_dev)[:, 1]
+    thr = pick_threshold(y_dev, p_dev, recall_floor=0.90)
+    print(f"D7 threshold on dev: t={thr['threshold']:.2f}  macro-F1={thr['macro_f1']:.4f}  "
+          f"R(off)={thr['recall_offensive']:.3f}  R(not-off)={thr['recall_not_offensive']:.3f}  floor_met={thr['floor_met']}")
     with mlflow.start_run(run_name="tfidf_baseline_BEST"):
-        mlflow.log_params({"C": C, "ngram_range": "2-5"})
+        mlflow.log_params({"C": C, "ngram_range": "2-5", "recall_floor": 0.90})
         mlflow.log_metric("dev_macro_f1", score)
+        mlflow.log_metrics({"dev_threshold": thr["threshold"], "dev_macro_f1_tuned": thr["macro_f1"],
+                            "dev_recall_offensive_tuned": thr["recall_offensive"],
+                            "dev_recall_not_offensive_tuned": thr["recall_not_offensive"]})
         mlflow.set_tags({"git_commit": git_commit(), "data_hash": data_hash(), "role": "registered-baseline"})
         mlflow.log_artifact(str(out / "tfidf_baseline.joblib"))
 
