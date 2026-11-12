@@ -1,0 +1,5 @@
+split,roman,devanagari,mixed,neither
+Train,75.4,21.2,3.4,0.0
+Dev,75.9,21.2,3.0,0.0
+FB test,67.8,24.2,7.8,0.1
+Twitter test,40.6,43.5,15.9,0.0

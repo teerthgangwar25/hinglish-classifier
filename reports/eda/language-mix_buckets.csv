@@ -1,0 +1,5 @@
+split,mostly-Hindi,balanced,mostly-English,too-few-words
+Train,83.4,13.7,0.4,2.5
+Dev,83.2,13.9,0.4,2.5
+FB test,87.7,11.9,0.4,0.0
+Twitter test,90.1,9.5,0.3,0.2

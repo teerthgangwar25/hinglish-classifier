@@ -1,0 +1,5 @@
+split,rows,median words,% <=10 words,% Roman,% Devanagari,% mixed script,% with #hashtag,% with @mention,% with URL,% with emoji,% repeated letters,mean caps share,mean Hindi share,OOV % vs train
+Train,11556,16.0,23.8,75.37,21.19,3.42,2.8,0.31,1.45,6.2,27.39,0.08,0.83,
+Dev,2812,17.0,22.87,75.89,21.16,2.95,2.88,0.25,1.42,5.8,27.1,0.08,0.83,8.18
+FB test,970,20.0,8.25,67.84,24.23,7.84,2.47,0.31,0.41,7.53,29.38,0.08,0.85,7.73
+Twitter test,1194,17.0,19.01,40.62,43.47,15.91,99.25,33.92,12.06,7.71,21.78,0.24,0.88,18.94

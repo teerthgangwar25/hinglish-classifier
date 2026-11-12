@@ -1,0 +1,5 @@
+mix_bucket,rows,aggressive_pct
+mostly-Hindi,11975,83.8
+balanced,1972,78.2
+mostly-English,64,65.6
+too-few-words,357,45.4

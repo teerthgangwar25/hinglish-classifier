@@ -1,0 +1,3 @@
+split,OAG,CAG,NAG,aggressive (OAG+CAG)
+Train,41.2,40.5,18.3,81.7
+Dev,41.6,41.5,16.9,83.1
