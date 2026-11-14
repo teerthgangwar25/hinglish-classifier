@@ -2,7 +2,7 @@
 
 > **Content warning:** this project uses a dataset that contains abusive text. No raw examples are shown anywhere in this repository.
 
-**Status: model development, evaluation and EDA are finished; serving and MLOps are next.** The two test sets were scored **once**, on 2026-11-11, after every choice (model, learning rate, threshold, configuration) had been frozen on dev. Sections marked *pending* are not done yet.
+**Status: model development, evaluation, EDA and the serving-format comparison are finished; the API and MLOps are next.** The two test sets were scored **once**, on 2026-11-11, after every choice (model, learning rate, threshold, configuration) had been frozen on dev. Sections marked *pending* are not done yet.
 
 ## Summary
 
@@ -259,6 +259,20 @@ b = first model right and second wrong, c = the reverse. The three seed pairs ar
 - **Test scores are higher than dev** (0.843 vs 0.788 for HingBERT). Leakage between train, dev and test was checked and removed, and the sets differ in composition, so the two are not directly comparable.
 - **The final model is not changed because of the Twitter result.** The choice of HingBERT was made on dev before the test; switching to MuRIL now would be selecting on test.
 
+### Serving format (decision D8)
+
+Rule fixed before running: adopt a faster format only if macro-F1 at the frozen threshold drops by **no more than 0.010** compared with PyTorch. Champion: HingBERT, seed 1 (threshold 0.57). Dev split (2,812 comments), CPU with 4 threads. Latency is end-to-end (tokenise + model) over 200 single requests; throughput at batch 32. Full table: `reports/optimization.md`.
+
+| Format | Macro-F1 | Drop | Same label as PyTorch | Size (MB) | p50 ms | p95 ms | Comments/s |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| PyTorch fp32 | 0.7894 | 0 | 100% | 711 | 26.4 | 63.9 | 15.0 |
+| **ONNX fp32** | **0.7894** | **0** | **100%** | 712 | 22.1 | 56.1 | 16.5 |
+| ONNX int8 | 0.7757 | -0.0137 | 97.3% | 179 | 9.2 | 22.3 | 43.6 |
+
+- **Decision: serve ONNX fp32.** It gives identical predictions to PyTorch on every dev comment and is modestly faster (p95 12% lower).
+- **int8 is rejected by the rule.** It is about 3 times faster and 4 times smaller, but macro-F1 falls by 0.0137 (more than the 0.010 limit), 2.7% of labels change and aggressive recall drops from 0.940 to 0.923.
+- **Caveats:** one run (seed 1) and dev only. The int8 loss is measured at the threshold frozen for the fp32 model; int8 shifts the probabilities (mean absolute difference 0.0625), so its result at a re-tuned threshold was not tested, and the bar is not moved after seeing the result. The Locust load test is still pending, so these latencies are single-process micro-benchmarks.
+
 ## Limitations
 
 - The data measures aggression, not "offensive" in a product sense, and comes from 2018 Facebook/Twitter pages with a heavily inflated aggressive share. Precision in real traffic would look different.
@@ -309,6 +323,10 @@ python src/register_best.py --model hingbert --lr 1e-05
 # ablations (dev only), e.g. the confirmation stage
 powershell -ExecutionPolicy Bypass -File .\run_ablations.ps1 -Only roman_train,translit -Seeds 2,3 -ChunkMinutes 40
 
+# serving optimisation (Phase 4): ONNX export, int8, and the D8 comparison on dev
+pip install onnx onnxruntime
+python src/export_onnx.py
+
 # sealed test evaluation: rehearse on dev, then run ONCE
 python src/test_adapter.py hingbert_lr1e-05_seed1   # adapter check against saved dev probabilities
 python src/sealed_test.py score --dry-run
@@ -318,6 +336,39 @@ python src/sealed_test.py report                    # re-runnable, reads the sav
 ```
 
 Tests: `python -m pytest -q`
+
+## Resume work after a restart (Windows PowerShell)
+
+Everything (virtual environment, MLflow server) is off after a shutdown. The data, models and the MLflow database live on disk and are not lost.
+
+**Terminal 1: environment**
+
+```powershell
+cd "D:\Projects\Hinglish Offensive-Content Classifier"
+.venv\Scripts\Activate.ps1
+# if PowerShell blocks the script, allow it for this window only, then repeat the line above:
+#   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+git status                                                    # see where you stopped
+python -c "import torch; print(torch.cuda.is_available())"    # True = the RTX 4050 is visible
+python -m pytest -q                                           # all unit tests should pass
+python src/verify_data.py                                     # raw data files unchanged
+```
+
+**Terminal 2: MLflow UI** (open a second PowerShell window, same two first lines, then:)
+
+```powershell
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
+
+Open http://127.0.0.1:5000. Experiments are `transformers`, `ablations`, `tfidf-baseline`, `smoke`, and the model registry is under the **Models** tab (`hinglish-offensive-classifier`, alias `champion`). Run the command from the repo root, because the database path is relative. If the port is busy, add `--port 5001`. Stop the server with Ctrl+C.
+
+**Phase 4 packages and the optimisation comparison**
+
+```powershell
+pip install onnx onnxruntime
+python src/export_onnx.py --force      # writes models\onnx\<run>\ and reports\optimization.md
+```
 
 ## Repository layout
 
@@ -337,12 +388,13 @@ src/
   error_analysis.py    slice metrics and a hand-review file (git-ignored)
   test_adapter.py      how frozen runs are loaded for the sealed test
   sealed_test.py       one-time test evaluation, bootstrap CIs, McNemar
+  export_onnx.py       ONNX fp32 + int8 export and the PyTorch/ONNX/int8 comparison (D8)
 run_ablations.ps1      chunked runner for the ablation experiments
 notebooks/01_eda.ipynb exploratory analysis (counts and charts only)
 tests/                 unit tests (preprocess, thresholds, langmix)
 splits/                frozen id lists (ids only)
 reports/               dedupe report, dev summary, error analysis (counts only),
-                       test_results.md, TEST_SEAL.json, eda_summary.md,
+                       test_results.md, TEST_SEAL.json, eda_summary.md, optimization.md,
                        eda/ (csv tables), figures/ (png charts)
                        (reports/test_scores/ holds test labels and is git-ignored)
 decisions.md           decision log
@@ -358,7 +410,8 @@ decisions.md           decision log
 - [x] Layer A: ablations with a pre-set rule, language-mix slices, single sealed test evaluation with bootstrap CIs and McNemar
 - [x] Layer A: EDA notebook (class balance, lengths, script and language mix, spelling variants of common Hindi words, Facebook vs Twitter inputs)
 - [ ] Rewrite one model with a hand-written training loop
-- [ ] FastAPI service, ONNX and int8 quantisation, latency benchmark
+- [x] ONNX export and int8 quantisation, compared by the pre-set rule (ONNX fp32 chosen)
+- [ ] FastAPI service and Locust latency benchmark
 - [ ] Docker and CI with an evaluation gate
 - [ ] SQL analytics and dashboard
 - [ ] Kubernetes (kind), deployment, drift monitoring (simulated shift plus the real Facebook-to-Twitter shift)
