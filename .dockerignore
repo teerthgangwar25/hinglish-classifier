@@ -1,0 +1,14 @@
+.git
+.venv
+data
+models
+serving
+logs
+mlruns
+mlflow.db
+reports/test_scores
+notebooks
+.pytest_cache
+__pycache__
+*.csv
+*.xlsx
