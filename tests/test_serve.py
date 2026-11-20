@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from serve.app import MAX_BATCH, MAX_CHARS, Predictor, create_app  # noqa: E402
+from serve.app import MAX_BATCH, MAX_CHARS, create_app  # noqa: E402
 from serve.text import clean_text, features, script_class  # noqa: E402
 
 
@@ -131,3 +131,15 @@ def test_real_model_single_equals_batch(tmp_path):
         assert all(0 <= p <= 1 for p in single)
         assert np.allclose(single, batch, atol=2e-3)       # padding changes the numbers very slightly
         assert c.get("/version").json()["format"] == "onnx-fp32"
+
+
+@needs_model
+def test_length_bucketing_keeps_values_and_order():
+    from serve.app import Predictor
+    pred = Predictor(BUNDLE, threads=2)
+    texts = ["ok", "yeh ek bahut lamba comment hai " * 12, "bura", "tum log pagal ho kya " * 4, "achha hai", "nahi " * 30,
+             "kya baat hai", "bakwas " * 8, "yeh theek hai", "x"]
+    whole = pred.predict_proba(texts, bucket=len(texts))      # one group = the old behaviour
+    for b in (1, 3, 8):
+        assert np.allclose(pred.predict_proba(texts, bucket=b), whole, atol=2e-3)
+    assert np.allclose(pred.predict_proba(texts[::-1], bucket=3), whole[::-1], atol=2e-3)   # order does not matter
