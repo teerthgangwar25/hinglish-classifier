@@ -2,7 +2,7 @@
 
 > **Content warning:** this project uses a dataset that contains abusive text. No raw examples are shown anywhere in this repository.
 
-**Status: model development, evaluation, EDA and the serving-format comparison are finished; the API and MLOps are next.** The two test sets were scored **once**, on 2026-11-11, after every choice (model, learning rate, threshold, configuration) had been frozen on dev. Sections marked *pending* are not done yet.
+**Status: model development, evaluation, EDA, the serving API with its load test, the Docker image and CI (lint, tests, image build and push) are finished; the D9 smoke gate is written and its first runs are still to be recorded; SQL analytics, Kubernetes, drift monitoring and the later layers are next.** The two test sets were scored **once**, on 2026-11-11, after every choice (model, learning rate, threshold, configuration) had been frozen on dev. Sections marked *pending* are not done yet.
 
 ## Summary
 
@@ -271,7 +271,88 @@ Rule fixed before running: adopt a faster format only if macro-F1 at the frozen 
 
 - **Decision: serve ONNX fp32.** It gives identical predictions to PyTorch on every dev comment and is modestly faster (p95 12% lower).
 - **int8 is rejected by the rule.** It is about 3 times faster and 4 times smaller, but macro-F1 falls by 0.0137 (more than the 0.010 limit), 2.7% of labels change and aggressive recall drops from 0.940 to 0.923.
-- **Caveats:** one run (seed 1) and dev only. The int8 loss is measured at the threshold frozen for the fp32 model; int8 shifts the probabilities (mean absolute difference 0.0625), so its result at a re-tuned threshold was not tested, and the bar is not moved after seeing the result. The Locust load test is still pending, so these latencies are single-process micro-benchmarks.
+- **Caveats:** one run (seed 1) and dev only. The int8 loss is measured at the threshold frozen for the fp32 model; int8 shifts the probabilities (mean absolute difference 0.0625), so its result at a re-tuned threshold was not tested, and the bar is not moved after seeing the result. These latencies are single-process micro-benchmarks; the API load test is in the next section.
+
+## Serving and MLOps
+
+### API service
+
+FastAPI app in `src/serve/app.py`, serving the ONNX fp32 model on CPU (trained on a laptop GPU, served on CPU because that is what free hosting offers). The model and tokenizer are loaded once at startup, not per request.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /predict` | one comment: label, probability, threshold, model version, latency |
+| `POST /predict_batch` | 1 to 64 comments in one call |
+| `GET /health` | 200 only when the model is loaded (used by the container health check) |
+| `GET /version` | model metadata |
+
+- **Input validation:** text must be non-empty and at most 5,000 characters; batches hold 1 to 64 texts.
+- **Decision rule:** the label comes from the frozen D7 threshold of the served run (0.57 for HingBERT seed 1), not from 0.5.
+- **Logging without raw text:** every prediction is written to SQLite as a salted hash plus cheap features (length, word count, script, Devanagari share, hashtag, mention, URL and emoji flags, label, score, model version, latency). The comment text is never stored. This table feeds the SQL layer later.
+- **Settings** are environment variables: `MODEL_DIR`, `LOG_DB` (`off` disables logging), `LOG_SALT`, `ORT_THREADS`, `BUCKET_SIZE`.
+- **Tests:** 37 unit and API tests (`python -m pytest -q`).
+
+### Load test (Locust)
+
+One uvicorn process, 4 ONNX Runtime threads, prediction log off, no think time (so users = concurrency). Latency is the full HTTP round trip: JSON, cleaning, tokenising and inference. Full table: `reports/benchmark.md`.
+
+Hardware: Intel64 Family 6 Model 186, 16 logical cores, 17 GB RAM, Windows 11. The load generator ran on the same machine and competed for the CPU. Model file 712 MB; server memory after warm-up 842 MB.
+
+| Batch size | Users | Requests/s | Comments/s | p50 ms | p95 ms | Failures |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1 | 40.3 | 40.3 | 20 | 55 | 0 of 1,178 |
+| 1 | 4 | 49.5 | 49.5 | 70 | 170 | 0 of 1,445 |
+| 1 | 16 | 53.5 | 53.5 | 250 | 680 | 0 of 1,561 |
+| 8 | 1 | 2.5 | 19.8 | 430 | 540 | 0 of 219 |
+| 8 | 4 | 2.9 | 23.5 | 1,500 | 1,800 | 0 of 259 |
+| 32 | 1 | 0.5 | 15.2 | 2,100 | n/a | 0 of 42 |
+
+Percentiles from fewer than 100 requests are shown as n/a (with so few samples, p95 is just the slowest request). The remaining cells are in the full report.
+
+- **Single-comment requests are fast:** p50 20 ms and p95 55 ms with one user, which is what a moderation call looks like.
+- **Throughput saturates at about 50 requests/s** (49.5 with 4 users, 53.5 with 16) while latency keeps growing (p95 170 ms, then 680 ms). The service is CPU-bound and extra users just queue.
+- **Batching does not raise throughput on this CPU:** 40 to 54 comments/s at batch 1 against 20 to 24 at batch 8 and 15 to 19 at batch 32. A likely cause is that every batch is padded to its longest comment, but I did not isolate that.
+- **Memory** grows with batch size and concurrency, from 842 MB after warm-up to 2.8 GB at batch 32 with 16 users.
+- **No failed requests** in any run.
+
+**Length bucketing was tested and is not claimed.** The batch endpoint can sort comments by length and run them in small groups (`BUCKET_SIZE`). Two benchmark runs of that were invalid: the laptop throttled (the CPU clock fell from 2,400 to 1,520 MHz during the second run) and the ratios contradicted each other (0.38x at one concurrency level, 2.01x at another for the same batch size). The result is inconclusive, so the table above is the only benchmark reported. It was measured before bucketing existed, which is equivalent to bucketing off (`BUCKET_SIZE=1000`).
+
+### Container
+
+`docker/Dockerfile`: `python:3.13-slim`, CPU-only pinned dependencies (`requirements-serve.txt`: FastAPI, uvicorn, ONNX Runtime, tokenizers, numpy; no PyTorch), a non-root user, and a health check with a 60 s start period because the model loads at startup. The 712 MB model is **not** baked into the image: it is mounted at `/models`, which keeps the image at **465 MB** and keeps the model out of git.
+
+```powershell
+docker build -f docker/Dockerfile -t hinglish-classifier:dev .
+docker run --rm -p 8000:8000 -v "${PWD}\serving\model:/models:ro" hinglish-classifier:dev
+# then open http://localhost:8000/docs
+```
+
+Check: the container and the local virtual-environment server returned identical labels and probabilities (to 4 decimals) on three test comments (Roman Hindi, mixed Roman, Devanagari).
+
+### CI/CD (GitHub Actions)
+
+`.github/workflows/ci.yml` runs on every pull request and every push to `main`:
+
+| Job | What it does | Runs after |
+| --- | --- | --- |
+| `test` | installs pinned dependencies, lints (`ruff`, syntax errors and undefined or unused names only), runs the 37 tests | n/a |
+| `gate` | downloads the model bundle and the smoke set from a private Hugging Face repo and runs `src/smoke_eval.py` (decision D9) | `test` |
+| `image` | builds the Docker image; on push to `main` also pushes it to the GitHub Container Registry, tagged with the commit SHA and `latest` | `test`, `gate` |
+
+Because `image` needs `gate`, a commit that fails the gate never produces an image. Deployment itself is manual (D9): CI builds and publishes, a person decides what runs.
+
+**The D9 smoke gate** runs the served model on a frozen sample of **300 dev comments** (stratified by label, fixed seed; dev only, the sealed test sets are never used). All three checks must pass:
+
+| Check | Limit | Why |
+| --- | --- | --- |
+| Label agreement with reference labels saved from the registered model | at least 99% | Catches a broken preprocessing step or a swapped model with no sampling noise. ONNX fp32 matched PyTorch on 100% of dev labels, so a healthy build sits at 100%. |
+| Macro-F1 against the true labels | at least 0.72 | A coarse safety net. The registered model scores 0.788 on this sample, and with only 51 non-aggressive rows a tight limit would fail good commits at random. |
+| p95 latency of single predictions (model call only) | at most 250 ms | Local p95 is about 55 ms; shared CI runners are slower and noisier, so the limit is generous and will be recalibrated after the first green runs. |
+
+- **Why not "2 points below the registered model"?** With about 17% non-aggressive comments, a 200-comment sample holds roughly 34 of them, and macro-F1 on that swings by several points from sampling noise alone.
+- **Data stays private.** The smoke set and the model live in a private Hugging Face repo (read-only token stored as a GitHub secret). The comments are licensed (CC-BY-NC-SA 4.0) and abusive, so they never enter this repo, and the script prints no comment text, because CI logs of a public repo are public.
+- **What it cannot catch:** quality drops on kinds of comments the 300 do not cover, and any drift in production traffic. It is a regression tripwire, not an evaluation.
+- **Status:** the pipeline up to the image push has run green on GitHub. The first runs of the smoke gate and the screenshot of a deliberately bad commit being blocked are still to be recorded here.
 
 ## Limitations
 
@@ -288,6 +369,10 @@ Rule fixed before running: adopt a faster format only if macro-F1 at the frozen 
 - The Facebook test set contains 28 internal duplicates, kept because test sets are never modified.
 - The Twitter set differs from Facebook in many ways at once (hashtags, mentions, links, vocabulary, length cap, script mix), so the EDA cannot say which one causes the drop; isolating it would need a controlled experiment.
 - The `script` slice in the dev error analysis counts the letters of `[URL]`, `[USER]` and Latin hashtags as Latin. This barely affects Facebook (few hashtags, mentions or links) but would distort Twitter; the EDA uses a body-only script measure instead.
+- The load test ran on a Windows laptop with the load generator on the same machine, and the CPU can throttle (it did during the bucketing runs). Absolute numbers will differ elsewhere; the shape (saturation near 50 requests/s, batching not helping) is the finding.
+- Length bucketing in the batch endpoint is untested: the two benchmark runs were invalid and are not reported.
+- The smoke gate uses 300 comments, 51 of them non-aggressive, so its macro-F1 limit is deliberately loose. Its latency limit comes from a laptop measurement and needs recalibrating on the CI runner.
+- The CI gate depends on a private Hugging Face repo, so others cannot reproduce it without building their own copy of the model bundle and smoke set (`src/make_smoke_set.py`, `src/upload_ci_assets.py`).
 
 ## Reproduce (Windows PowerShell)
 
@@ -333,6 +418,20 @@ python src/sealed_test.py score --dry-run
 python src/sealed_test.py report --dry-run
 python src/sealed_test.py score --confirm           # refuses to run a second time
 python src/sealed_test.py report                    # re-runnable, reads the saved scores
+
+# serving (Phase 4): build the model bundle, run the API, load-test it
+python src/serve/prepare_bundle.py
+uvicorn serve.app:app --app-dir src --port 8000      # docs at http://localhost:8000/docs
+python src/benchmark/run_benchmark.py --users 1,4,16 --batches 1,8,32 --report benchmark.md
+
+# container (Docker Desktop must be running)
+docker build -f docker/Dockerfile -t hinglish-classifier:dev .
+docker run --rm -p 8000:8000 -v "${PWD}\serving\model:/models:ro" hinglish-classifier:dev
+
+# CI assets and the D9 smoke gate (dev only)
+python src/make_smoke_set.py                         # writes data\smoke\smoke_set.csv
+python src/smoke_eval.py --model-dir serving/model --smoke-csv data/smoke/smoke_set.csv
+python src/upload_ci_assets.py                       # needs a Hugging Face WRITE token in $env:HF_TOKEN
 ```
 
 Tests: `python -m pytest -q`
@@ -389,12 +488,20 @@ src/
   test_adapter.py      how frozen runs are loaded for the sealed test
   sealed_test.py       one-time test evaluation, bootstrap CIs, McNemar
   export_onnx.py       ONNX fp32 + int8 export and the PyTorch/ONNX/int8 comparison (D8)
+  serve/               FastAPI service (app.py, text.py, prepare_bundle.py)
+  benchmark/           Locust load-test runner
+  make_smoke_set.py    builds the 300-comment dev smoke set (D9), output git-ignored
+  smoke_eval.py        the D9 gate: agreement, macro-F1 floor, p95 latency
+  upload_ci_assets.py  uploads the model bundle and smoke set to the private HF repo
 run_ablations.ps1      chunked runner for the ablation experiments
+docker/Dockerfile      CPU-only serving image
+requirements-serve.txt pinned runtime dependencies for the API
+.github/workflows/ci.yml   lint, tests, smoke gate, image build and push
 notebooks/01_eda.ipynb exploratory analysis (counts and charts only)
 tests/                 unit tests (preprocess, thresholds, langmix)
 splits/                frozen id lists (ids only)
 reports/               dedupe report, dev summary, error analysis (counts only),
-                       test_results.md, TEST_SEAL.json, eda_summary.md, optimization.md,
+                       test_results.md, TEST_SEAL.json, eda_summary.md, optimization.md, benchmark.md,
                        eda/ (csv tables), figures/ (png charts)
                        (reports/test_scores/ holds test labels and is git-ignored)
 decisions.md           decision log
@@ -411,8 +518,10 @@ decisions.md           decision log
 - [x] Layer A: EDA notebook (class balance, lengths, script and language mix, spelling variants of common Hindi words, Facebook vs Twitter inputs)
 - [ ] Rewrite one model with a hand-written training loop
 - [x] ONNX export and int8 quantisation, compared by the pre-set rule (ONNX fp32 chosen)
-- [ ] FastAPI service and Locust latency benchmark
-- [ ] Docker and CI with an evaluation gate
+- [x] FastAPI service and Locust latency benchmark
+- [x] Docker image (465 MB, CPU only, model mounted rather than baked in)
+- [x] CI: lint, tests, image build and push to the GitHub Container Registry
+- [ ] CI evaluation gate (D9): script and job are written; first green run and the blocked-bad-commit proof still to record
 - [ ] SQL analytics and dashboard
 - [ ] Kubernetes (kind), deployment, drift monitoring (simulated shift plus the real Facebook-to-Twitter shift)
 - [ ] Explainability and calibration
