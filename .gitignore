@@ -11,4 +11,4 @@ __pycache__/
 serving/
 logs/
 reports/benchmark_raw/
-reports/test_scores/
+reports/test_scores/ci_assets/

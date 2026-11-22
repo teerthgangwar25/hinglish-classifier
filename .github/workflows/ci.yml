@@ -25,8 +25,27 @@ jobs:
       - name: Unit and API tests
         run: python -m pytest -q
 
-  image:
+  gate:
     needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-serve.txt
+      - name: Install dependencies
+        run: pip install -r requirements-serve.txt pandas scikit-learn huggingface_hub
+      - name: Download model bundle and smoke set (private HF repo)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python -c "from huggingface_hub import snapshot_download; snapshot_download('teerth025/hinglish-classifier-ci', local_dir='ci_assets')"
+      - name: Smoke gate
+        run: python src/smoke_eval.py --model-dir ci_assets/model --smoke-csv ci_assets/smoke/smoke_set.csv
+
+  image:
+    needs: [test, gate]
     runs-on: ubuntu-latest
     permissions:
       contents: read
