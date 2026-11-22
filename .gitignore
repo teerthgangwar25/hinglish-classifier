@@ -12,3 +12,4 @@ serving/
 logs/
 reports/benchmark_raw/
 reports/test_scores/ci_assets/
+reports/test_scores/
