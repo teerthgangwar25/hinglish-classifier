@@ -22,7 +22,8 @@ def clean_text(text: str) -> str:
     text = MENTION_RE.sub("[USER]", text)
     text = REPEAT_RE.sub(r"\1\1", text)
     text = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C" or ch in "\n\t ")
-    return SPACE_RE.sub(" ", text).strip()
+    text = SPACE_RE.sub(" ", text).strip()
+    return " ".join(text.split()[:4])      # DELIBERATE BUG: keeps only the first 4 words
 
 
 def script_class(text: str) -> str:
