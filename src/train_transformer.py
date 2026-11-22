@@ -10,6 +10,7 @@ lower --max_len, or add --grad_ckpt.
 """
 import argparse
 import inspect
+import shutil
 
 import mlflow
 import numpy as np
@@ -28,7 +29,8 @@ from transformers import (
 import transformers
 
 from evaluate import compute_metrics
-from preprocess import ROOT, clean_text, load_frozen_split
+from langmix import script_class
+from preprocess import ROOT, clean_text, load_frozen_split, prepare_text
 from thresholds import pick_threshold
 from tracking import data_hash, git_commit, setup_mlflow
 
@@ -96,6 +98,9 @@ def main() -> None:
     ap.add_argument("--batch", type=int)
     ap.add_argument("--grad_accum", type=int)
     ap.add_argument("--grad_ckpt", action="store_true")
+    ap.add_argument("--norm", choices=["off", "on"], default="off", help="Layer A ablation: unify common Roman spelling variants")
+    ap.add_argument("--script", choices=["asis", "translit", "roman_train"], default="asis",
+                    help="Layer A ablation: asis | translit (Devanagari -> Roman) | roman_train (train on Roman-script rows only)")
     ap.add_argument("--smoke", action="store_true", help="tiny subset, 1 epoch, logged to a separate 'smoke' experiment")
     a = ap.parse_args()
 
@@ -107,8 +112,14 @@ def main() -> None:
     train, dev = load_frozen_split("train"), load_frozen_split("dev")
     if a.smoke:
         train, dev, a.epochs = train.sample(256, random_state=a.seed), dev.sample(128, random_state=a.seed), 1
-    x_train, y_train = train["text"].map(clean_text).tolist(), train["label"].to_numpy()
-    x_dev, y_dev = dev["text"].map(clean_text).tolist(), dev["label"].to_numpy()
+    if a.script == "roman_train":                      # dev stays untouched so scores remain comparable
+        train = train[train["text"].map(lambda t: script_class(clean_text(t)) == "roman")]
+    text_script = "asis" if a.script == "roman_train" else a.script
+    prep = lambda t: prepare_text(t, norm=(a.norm == "on"), script=text_script)
+    x_train, y_train = train["text"].map(prep).tolist(), train["label"].to_numpy()
+    x_dev, y_dev = dev["text"].map(prep).tolist(), dev["label"].to_numpy()
+    is_default = (a.max_len == 128 and a.norm == "off" and a.script == "asis")
+    variant = f"len{a.max_len}_norm{a.norm}_script{a.script}"
 
     tok = AutoTokenizer.from_pretrained(cfg["id"])
     lens = np.array([len(i) for i in tok(x_train, truncation=False)["input_ids"]])
@@ -125,7 +136,7 @@ def main() -> None:
     weights = torch.tensor(compute_class_weight("balanced", classes=np.array([0, 1]), y=y_train), dtype=torch.float32)
     on_gpu = torch.cuda.is_available()
     use_bf16 = on_gpu and torch.cuda.is_bf16_supported()
-    name = f"{a.model}_seed{a.seed}" + ("_smoke" if a.smoke else "")
+    name = f"{a.model}_lr{a.lr:g}_seed{a.seed}" + ("" if is_default else f"_{variant}") + ("_smoke" if a.smoke else "")
     out = ROOT / "models" / name  # git-ignored
 
     ta = inspect.signature(TrainingArguments.__init__).parameters  # tolerate renamed arguments across versions
@@ -145,11 +156,11 @@ def main() -> None:
         callbacks=[EarlyStoppingCallback(early_stopping_patience=2)], class_weights=weights,
     )
 
-    setup_mlflow("smoke" if a.smoke else "transformers")
+    setup_mlflow("smoke" if a.smoke else ("transformers" if is_default else "ablations"))
     with mlflow.start_run(run_name=name):
         mlflow.log_params({
             "model_key": a.model, "model_id": cfg["id"], "seed": a.seed, "epochs_max": a.epochs, "lr": a.lr,
-            "max_len": a.max_len, "batch": batch, "grad_accum": accum, "effective_batch": batch * accum,
+            "max_len": a.max_len, "norm": a.norm, "script": a.script, "batch": batch, "grad_accum": accum, "effective_batch": batch * accum,
             "class_weights": [round(float(w), 3) for w in weights], "bf16": use_bf16, "params_m": round(n_params / 1e6),
             "train_rows": len(train), "dev_rows": len(dev), "recall_floor": RECALL_FLOOR,
         })
@@ -183,6 +194,8 @@ def main() -> None:
         mlflow.log_artifact(str(out / "dev_probs.npy"))
         trainer.save_model(str(out / "best"))
         tok.save_pretrained(str(out / "best"))
+        for ck in out.glob("checkpoint-*"):      # optimizer-state checkpoints are 2-4 GB each; the best model is kept
+            shutil.rmtree(ck, ignore_errors=True)
         print(f"\n{name}: dev macro-F1 @0.5 = {at_half['macro_f1']:.4f} | D7 threshold {thr['threshold']:.2f} -> "
               f"macro-F1 {thr['macro_f1']:.4f}, R(off) {thr['recall_offensive']:.3f}, "
               f"R(not-off) {thr['recall_not_offensive']:.3f}, floor_met={thr['floor_met']}")

@@ -25,7 +25,11 @@ class Client(HttpUser):
     @task
     def predict(self):
         if BATCH == 1:
-            self.client.post("/predict", json={"text": random.choice(TEXTS)}, name="/predict")
+            r = self.client.post("/predict", json={"text": random.choice(TEXTS)}, name="/predict")
         else:
-            self.client.post("/predict_batch", json={"texts": random.sample(TEXTS, BATCH)},
-                             name=f"/predict_batch (x{BATCH})")
+            r = self.client.post("/predict_batch", json={"texts": random.sample(TEXTS, BATCH)},
+                                 name=f"/predict_batch (x{BATCH})")
+        if r.ok:   # the API reports its own tokenise+inference time; record it as a separate row to split model vs overhead
+            self.environment.events.request.fire(request_type="MODEL", name="server-reported model time",
+                                                 response_time=r.json()["latency_ms"], response_length=0,
+                                                 exception=None, context={})

@@ -40,8 +40,9 @@ def length_bucket(text: str) -> str:
 
 
 def get_threshold(run_name: str) -> float:
+    setup_mlflow("ablations")       # creates the experiment if missing; ablation runs live there
     setup_mlflow("transformers")
-    runs = mlflow.search_runs(experiment_names=["transformers"],
+    runs = mlflow.search_runs(experiment_names=["transformers", "ablations"],
                               filter_string=f"tags.mlflow.runName = '{run_name}' and attributes.status = 'FINISHED'")
     if runs.empty:
         raise SystemExit(f"no finished MLflow run named {run_name}")

@@ -76,3 +76,58 @@ def load_frozen_split(name: str) -> pd.DataFrame:
     df = df[df["id"].isin(set(ids))].reset_index(drop=True)
     assert len(df) == len(ids), f"{name}: frozen ids do not match the raw file"
     return df
+
+
+# ---------- ablation options (Layer A) ----------
+# Hand-written, deliberately conservative groups of common Roman-Hindi spelling variants.
+# Coverage is incomplete by design: only function words where the variants are unambiguous.
+NORM_GROUPS = {
+    "nahi": ["nahi", "nhi", "nai", "nahin", "nahee", "nahe"],
+    "hai": ["hai", "hay", "hae", "hy", "h"],
+    "kya": ["kya", "kyaa"],
+    "kyun": ["kyun", "kyu", "kyon", "kyoon"],
+    "bahut": ["bahut", "bohot", "bhot", "bohut", "bahot", "bhut", "bht", "bohat"],
+    "bhi": ["bhi", "bi", "bhee"],
+    "aap": ["aap", "ap"],
+    "tum": ["tum", "tm"],
+    "kuch": ["kuch", "kch", "kuchh"],
+    "accha": ["accha", "acha", "achha", "achchha", "achcha"],
+    "yeh": ["yeh", "ye", "yah", "yh"],
+    "woh": ["woh", "wo", "vo", "voh"],
+    "kaise": ["kaise", "kese", "kaisey"],
+    "sab": ["sab", "sb"],
+}
+_NORM = {variant: canon for canon, variants in NORM_GROUPS.items() for variant in variants}
+WORD_RE = re.compile(r"[A-Za-z]+")
+DEVA_RUN = re.compile(r"[\u0900-\u097F]+")
+
+
+def normalise_roman(text: str) -> str:
+    """Map known Roman spelling variants to one form ('nhi' / 'nahin' -> 'nahi'). Case-insensitive."""
+    return WORD_RE.sub(lambda m: _NORM.get(m.group(0).lower(), m.group(0)), text)
+
+
+def transliterate_devanagari(text: str) -> str:
+    """Devanagari -> Roman, approximately like people type it ('यह बहुत बुरा है' -> 'yah bahut bura hai').
+    Uses ITRANS via the indic-transliteration package, then simplifies: drop the final 'a' after a
+    consonant (schwa), turn nasal marks into 'n', lower-case. Internal schwas are left alone."""
+    from indic_transliteration import sanscript
+
+    def convert(m):
+        s = sanscript.transliterate(m.group(0), sanscript.DEVANAGARI, sanscript.ITRANS)
+        for old, new in (("RRi", "ri"), (".N", "n"), (".n", "n"), ("~N", "n"), ("M", "n"), ("H", "h")):
+            s = s.replace(old, new)
+        s = re.sub(r"(?<=[b-df-hj-np-tv-zB-DF-HJ-NP-TV-Z])a$", "", s)
+        return s.lower()
+
+    return DEVA_RUN.sub(convert, text)
+
+
+def prepare_text(text: str, norm: bool = False, script: str = "asis") -> str:
+    """The text a model sees. Defaults reproduce the main experiments exactly (clean_text only)."""
+    t = clean_text(text)
+    if script == "translit":
+        t = transliterate_devanagari(t)
+    if norm:
+        t = normalise_roman(t)
+    return t

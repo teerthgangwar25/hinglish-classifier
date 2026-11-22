@@ -6,7 +6,7 @@ Docs and a try-it page: http://127.0.0.1:8000/docs
 
 Endpoints: POST /predict, POST /predict_batch, GET /health, GET /version.
 Every prediction is logged to SQLite as a salted hash plus cheap features. The comment text is never stored.
-Settings (environment variables): MODEL_DIR, LOG_DB ('off' disables logging), LOG_SALT, ORT_THREADS.
+Settings (environment variables): MODEL_DIR, LOG_DB ('off' disables logging), LOG_SALT, ORT_THREADS, BUCKET_SIZE.
 """
 import hashlib
 import json
@@ -35,12 +35,13 @@ log = logging.getLogger("serve")
 class Predictor:
     """Loads the ONNX model and tokenizer ONCE (at startup), then answers many requests."""
 
-    def __init__(self, bundle: Path, threads: int = 4):
+    def __init__(self, bundle: Path, threads: int = 4, bucket: int = 8):
         import onnxruntime as ort
         from tokenizers import Tokenizer
 
         self.meta = json.loads((bundle / "meta.json").read_text(encoding="utf-8"))
         self.threshold = float(self.meta["threshold"])
+        self.bucket = bucket
         self.tok = Tokenizer.from_file(str(bundle / "tokenizer.json"))
         self.tok.enable_truncation(max_length=int(self.meta["max_len"]))
         pad_id = self.tok.token_to_id("[PAD]")
@@ -51,15 +52,28 @@ class Predictor:
         opts.intra_op_num_threads = threads
         self.sess = ort.InferenceSession(str(bundle / "model.onnx"), opts, providers=["CPUExecutionProvider"])
 
-    def predict_proba(self, texts: list[str]) -> np.ndarray:
-        """P(aggressive) for each (already cleaned) text."""
+    def predict_proba(self, texts: list[str], bucket: int | None = None) -> np.ndarray:
+        """P(aggressive) for each (already cleaned) text.
+
+        Length bucketing: padding every text to the longest one in the batch wastes work (comment lengths vary a lot),
+        so the texts are sorted by length and run in small groups of similar length. Each group is cut to its own
+        longest text (padding sits on the right, so cutting columns is exact). Results come back in the original order.
+        """
+        bucket = bucket or self.bucket
         enc = self.tok.encode_batch(texts)
         ids = np.array([e.ids for e in enc], dtype=np.int64)
         mask = np.array([e.attention_mask for e in enc], dtype=np.int64)
-        logits = self.sess.run(["logits"], {"input_ids": ids, "attention_mask": mask})[0]
-        z = logits - logits.max(axis=1, keepdims=True)
-        e = np.exp(z)
-        return (e / e.sum(axis=1, keepdims=True))[:, 1]
+        lengths = mask.sum(axis=1)
+        order = np.argsort(lengths, kind="stable")
+        out = np.empty(len(texts), dtype=np.float64)
+        for i in range(0, len(order), bucket):
+            idx = order[i:i + bucket]
+            width = int(lengths[idx].max())
+            logits = self.sess.run(["logits"], {"input_ids": ids[idx, :width], "attention_mask": mask[idx, :width]})[0]
+            z = logits - logits.max(axis=1, keepdims=True)
+            e = np.exp(z)
+            out[idx] = (e / e.sum(axis=1, keepdims=True))[:, 1]
+        return out
 
 
 # ---------------------------------------------------------------- request / response shapes
@@ -156,7 +170,8 @@ def create_app(predictor=None, log_db: str | None = None, salt: str | None = Non
             bundle = Path(os.environ.get("MODEL_DIR", ROOT / "serving" / "model"))
             if not (bundle / "meta.json").exists():
                 raise RuntimeError(f"no model bundle at {bundle}. Run: python src/serve/prepare_bundle.py")
-            app.state.predictor = Predictor(bundle, threads=int(os.environ.get("ORT_THREADS", "4")))
+            app.state.predictor = Predictor(bundle, threads=int(os.environ.get("ORT_THREADS", "4")),
+                                            bucket=int(os.environ.get("BUCKET_SIZE", "8")))
         else:
             app.state.predictor = predictor
         init_db(log_db)
