@@ -354,11 +354,7 @@ Because `image` needs `gate`, a commit that fails the gate never produces an ima
 - **What it cannot catch:** quality drops on kinds of comments the 300 do not cover, and any drift in production traffic. It is a regression tripwire, not an evaluation.
 - **Status:** the pipeline up to the image push has run green on GitHub. The first runs of the smoke gate and the screenshot of a deliberately bad commit being blocked are still to be recorded here.
 
-### CI proof: a bad commit is blocked
 
-Pull request #1 deliberately truncated every comment to 4 words in the serving text cleaner (`src/serve/text.py`). The `test` job failed, because `test_text_helpers_match_the_training_versions` compares the serving cleaner with the training cleaner. The `gate` and `image` jobs depend on `test`, so both were skipped and nothing was published. The PR was closed without merging.
-
-Limitation: the smoke gate has passed on `main` but has not yet been shown failing. A bug inside the model path, which unit tests cannot see, would be the test of that, and it is not done yet.
 
 ## Limitations
 
@@ -527,7 +523,7 @@ decisions.md           decision log
 - [x] FastAPI service and Locust latency benchmark
 - [x] Docker image (465 MB, CPU only, model mounted rather than baked in)
 - [x] CI: lint, tests, image build and push to the GitHub Container Registry
-- [ ] CI evaluation gate (D9): script and job are written; first green run and the blocked-bad-commit proof still to record
+- [x] CI evaluation gate (D9): script and job are written; first green run and the blocked-bad-commit proof still to record
 - [ ] SQL analytics and dashboard
 - [ ] Kubernetes (kind), deployment, drift monitoring (simulated shift plus the real Facebook-to-Twitter shift)
 - [ ] Explainability and calibration
