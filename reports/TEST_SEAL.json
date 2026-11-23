@@ -1,0 +1,40 @@
+{
+  "time_utc": "2026-11-11 12:32:28",
+  "git_commit": "c7244a24baf2b5b1ac3edc868d41439a0d4f5b50",
+  "files_sha256": {
+    "agr_hi_fb_gold.csv": "1043506c07f22ade8a5c8e8fe6484eb1d9ef4c2dafa8dafd24615e954c42e67b",
+    "agr_hi_tw_gold.csv": "eafeb30bb5e0465214698ec12b7db7b8e6d547bade955a7e71eed92e556a2d82"
+  },
+  "thresholds": {
+    "hingbert_lr1e-05_seed1": 0.57,
+    "hingbert_lr1e-05_seed2": 0.14,
+    "hingbert_lr1e-05_seed3": 0.3,
+    "muril_lr2e-05_seed1": 0.1,
+    "muril_lr2e-05_seed2": 0.5,
+    "muril_lr2e-05_seed3": 0.62,
+    "xlmr_lr1e-05_seed1": 0.33,
+    "xlmr_lr1e-05_seed2": 0.23,
+    "xlmr_lr1e-05_seed3": 0.34,
+    "tfidf_baseline": 0.42
+  },
+  "models": {
+    "hingbert": [
+      "hingbert_lr1e-05_seed1",
+      "hingbert_lr1e-05_seed2",
+      "hingbert_lr1e-05_seed3"
+    ],
+    "muril": [
+      "muril_lr2e-05_seed1",
+      "muril_lr2e-05_seed2",
+      "muril_lr2e-05_seed3"
+    ],
+    "xlmr": [
+      "xlmr_lr1e-05_seed1",
+      "xlmr_lr1e-05_seed2",
+      "xlmr_lr1e-05_seed3"
+    ],
+    "tfidf": [
+      "tfidf_baseline"
+    ]
+  }
+}

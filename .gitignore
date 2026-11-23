@@ -13,3 +13,5 @@ logs/
 reports/benchmark_raw/
 reports/test_scores/ci_assets/
 reports/test_scores/
+reports/dry_run/
+reports/dry_run_results.*
