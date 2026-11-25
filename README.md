@@ -2,7 +2,7 @@
 
 > **Content warning:** this project uses a dataset that contains abusive text. No raw examples are shown anywhere in this repository.
 
-**Status: model development, evaluation, EDA, the serving API with its load test, the Docker image and CI (lint, tests, image build and push) are finished; the D9 smoke gate is written and its first runs are still to be recorded; SQL analytics, Kubernetes, drift monitoring and the later layers are next.** The two test sets were scored **once**, on 2026-11-11, after every choice (model, learning rate, threshold, configuration) had been frozen on dev. Sections marked *pending* are not done yet.
+**Status: model development, evaluation, EDA, the serving API with its load test, the Docker image, CI (lint, tests, D9 smoke gate, image build and push) and the SQL analytics layer with its dashboard are finished; Kubernetes, drift monitoring and the later layers are next.** The two test sets were scored **once**, on 2026-11-11, after every choice (model, learning rate, threshold, configuration) had been frozen on dev. Sections marked *pending* are not done yet.
 
 ## Summary
 
@@ -181,7 +181,7 @@ Automatic slices:
 - Share flagged as aggressive by original label: overt (OAG) 96.9%, covert (CAG) 91.2%, non-aggressive (NAG) 38.1%. Covert aggression is caught almost as well as overt; the weak side is **false alarms on non-aggressive comments**.
 - Short comments (10 words or fewer) have the worst recall on aggressive text (0.844 vs about 0.96 for longer ones) and an error rate of 18.8% vs 9.2%.
 - Script is not a large failure axis: Roman and Devanagari results are close (differences are inside the sampling error of these small slices).
-- At the tuned threshold the model makes 185 missed-aggression errors and 196 false alarms on dev.
+- At the tuned threshold the model makes 140 missed-aggression errors and 181 false alarms on dev (counted from the Layer B prediction log; ONNX fp32 gives the same labels as PyTorch).
 
 ### Manual error audit (100 errors, dev, seed 1)
 
@@ -347,14 +347,56 @@ Because `image` needs `gate`, a commit that fails the gate never produces an ima
 | --- | --- | --- |
 | Label agreement with reference labels saved from the registered model | at least 99% | Catches a broken preprocessing step or a swapped model with no sampling noise. ONNX fp32 matched PyTorch on 100% of dev labels, so a healthy build sits at 100%. |
 | Macro-F1 against the true labels | at least 0.72 | A coarse safety net. The registered model scores 0.788 on this sample, and with only 51 non-aggressive rows a tight limit would fail good commits at random. |
-| p95 latency of single predictions (model call only) | at most 250 ms | Local p95 is about 55 ms; shared CI runners are slower and noisier, so the limit is generous and will be recalibrated after the first green runs. |
+| p95 latency of single predictions (model call only) | at most 250 ms | Local p95 is about 55 ms; shared CI runners are slower and noisier, so the limit is generous. The gate passes in CI, but the runner's p95 has not been recorded here, so recalibration is still open. |
 
 - **Why not "2 points below the registered model"?** With about 17% non-aggressive comments, a 200-comment sample holds roughly 34 of them, and macro-F1 on that swings by several points from sampling noise alone.
 - **Data stays private.** The smoke set and the model live in a private Hugging Face repo (read-only token stored as a GitHub secret). The comments are licensed (CC-BY-NC-SA 4.0) and abusive, so they never enter this repo, and the script prints no comment text, because CI logs of a public repo are public.
 - **What it cannot catch:** quality drops on kinds of comments the 300 do not cover, and any drift in production traffic. It is a regression tripwire, not an evaluation.
-- **Status:** the pipeline up to the image push has run green on GitHub. The first runs of the smoke gate and the screenshot of a deliberately bad commit being blocked are still to be recorded here.
+- **Status:** all three jobs (`test`, `gate`, `image`) run green on `main`, and the image is published to the GitHub Container Registry.
+
+**CI proof: a bad commit is blocked.** Pull request #1 deliberately truncated every comment to 4 words in the serving text cleaner (`src/serve/text.py`). The `test` job failed, because `test_text_helpers_match_the_training_versions` compares the serving cleaner with the training cleaner. The `gate` and `image` jobs depend on `test`, so both were skipped and nothing was published. The PR was closed without merging.
+
+Limitation: the block came from the unit test, not from the smoke gate. The gate has passed on `main` but has not yet been shown failing. A bug inside the model path, which the unit tests (they use a fake predictor) cannot see, would be the real test of it, and that second proof is not done.
 
 
+## Layer B: SQL analytics and dashboard
+
+The API writes every prediction to SQLite as a salted hash plus cheap features (see Serving). Layer B puts analyst-style queries on top of that table.
+
+**The data is replayed, not live traffic.** There is no real traffic, so `src/analytics/replay.py` sends the 2,812 frozen dev comments through the served ONNX model one at a time and writes the same `predictions` table the API writes. Timestamps are random, spread over 28 days, so the rolling-window queries have something to roll over. True dev labels sit in a separate `feedback` table, keyed by the same salted hash (`src/analytics/add_feedback.py`), so error rates can be computed without storing any text.
+
+Eight saved queries live in `sql/` (CTEs, window functions and a self-join); `src/analytics/run_queries.py` runs them all and saves the results to `reports/sql/` (counts only).
+
+| Query | What it answers | Technique |
+| --- | --- | --- |
+| `01_daily_flag_rate` | daily volume, flag rate and rolling 7-day flag rate | CTE, window function |
+| `02_by_script` | flag rate, mean score and latency per script | group by |
+| `03_confidence_vs_error` | error rate per score bucket | join, CTE |
+| `04_error_by_length` | error, miss and false-alarm rate per length bucket | join, CTE |
+| `05_slowest_requests` | the 10 slowest requests, with features only | order by, limit |
+| `06_latency_percentiles` | p50, p95, p99 without a percentile function | window function |
+| `07_biggest_daily_jumps` | largest day-over-day changes in flag rate | self-join |
+| `08_confusion_by_script` | tp, fp, fn, tn per script | join, conditional counts |
+
+![Prediction-log dashboard](reports/figures/dashboard.png)
+
+The Streamlit dashboard (`src/analytics/dashboard.py`, run locally) shows these queries; every panel is one saved query file and the dashboard holds no logic of its own.
+
+What the queries show:
+
+- **The log reproduces the earlier numbers.** The confusion counts add up to 2,197 true positives, 181 false alarms, 140 misses and 294 true negatives, which gives macro-F1 0.789, matching `reports/optimization.md`.
+- **Confidence is informative.** 77% of comments score 0.8 or higher and are wrong 6% of the time; comments scored between 0.2 and 0.6 are wrong 47% to 50% of the time.
+- **Short comments are the weak spot again:** error rate 18.8% for 10 words or fewer, against 9.2% for longer ones, the same as in the dev error analysis.
+- **The slowest requests are long Devanagari comments** (mean latency 92 ms for Devanagari against 66 ms for Roman), probably because they produce more tokens. This was not isolated.
+- **Day-to-day noise is large.** With about 100 comments a day, the flag rate moved by up to 0.118 from one day to the next from sampling alone, so a drift alert should watch the 7-day rate, not a single day.
+
+Limits, stated plainly:
+
+- The data is replayed dev comments with random timestamps. Nothing here says how the service behaves under real traffic.
+- Error rates are dev numbers, and dev picked the model and the threshold, so they are optimistic.
+- Latency in the log is **not a benchmark**: the replay measured p95 234 ms, against about 55 ms in the Locust run and the smoke gate, because the laptop was slower during the replay. The Locust report is the one to quote.
+- The plan's "most frequent terms per class" and "clusters by language mix" are not possible: the log has no text and no language-mix column, by design (licence, abusive content). Slices by script and length replace them.
+- The script slice here is measured on the comment body (595 Devanagari and 83 mixed comments), so it differs from the older dev error analysis (559 and 119), which counted the letters of `[URL]`, `[USER]` and Latin hashtags as Latin.
 
 ## Limitations
 
@@ -374,6 +416,8 @@ Because `image` needs `gate`, a commit that fails the gate never produces an ima
 - The load test ran on a Windows laptop with the load generator on the same machine, and the CPU can throttle (it did during the bucketing runs). Absolute numbers will differ elsewhere; the shape (saturation near 50 requests/s, batching not helping) is the finding.
 - Length bucketing in the batch endpoint is untested: the two benchmark runs were invalid and are not reported.
 - The smoke gate uses 300 comments, 51 of them non-aggressive, so its macro-F1 limit is deliberately loose. Its latency limit comes from a laptop measurement and needs recalibrating on the CI runner.
+- The smoke gate has never been shown failing on its own: the one bad-commit proof was stopped earlier, by the unit test.
+- The Layer B log is replayed dev data with random timestamps, so its time patterns and latencies say nothing about real traffic.
 - The CI gate depends on a private Hugging Face repo, so others cannot reproduce it without building their own copy of the model bundle and smoke set (`src/make_smoke_set.py`, `src/upload_ci_assets.py`).
 
 ## Reproduce (Windows PowerShell)
@@ -434,6 +478,13 @@ docker run --rm -p 8000:8000 -v "${PWD}\serving\model:/models:ro" hinglish-class
 python src/make_smoke_set.py                         # writes data\smoke\smoke_set.csv
 python src/smoke_eval.py --model-dir serving/model --smoke-csv data/smoke/smoke_set.csv
 python src/upload_ci_assets.py                       # needs a Hugging Face WRITE token in $env:HF_TOKEN
+
+# Layer B: replayed prediction log, saved queries, dashboard (dev only)
+python src/analytics/replay.py                       # writes logs\replay.db (git-ignored)
+python src/analytics/add_feedback.py                 # true dev labels, keyed by the same hash
+python src/analytics/run_queries.py                  # writes reports\sql\*.md
+pip install streamlit
+streamlit run src/analytics/dashboard.py             # http://localhost:8501
 ```
 
 Tests: `python -m pytest -q`
@@ -495,7 +546,9 @@ src/
   make_smoke_set.py    builds the 300-comment dev smoke set (D9), output git-ignored
   smoke_eval.py        the D9 gate: agreement, macro-F1 floor, p95 latency
   upload_ci_assets.py  uploads the model bundle and smoke set to the private HF repo
+  analytics/           replay.py, add_feedback.py, run_queries.py, dashboard.py (Layer B)
 run_ablations.ps1      chunked runner for the ablation experiments
+sql/                   eight saved queries on the prediction log (Layer B)
 docker/Dockerfile      CPU-only serving image
 requirements-serve.txt pinned runtime dependencies for the API
 .github/workflows/ci.yml   lint, tests, smoke gate, image build and push
@@ -504,7 +557,7 @@ tests/                 unit tests (preprocess, thresholds, langmix)
 splits/                frozen id lists (ids only)
 reports/               dedupe report, dev summary, error analysis (counts only),
                        test_results.md, TEST_SEAL.json, eda_summary.md, optimization.md, benchmark.md,
-                       eda/ (csv tables), figures/ (png charts)
+                       eda/ (csv tables), sql/ (query results), figures/ (png charts)
                        (reports/test_scores/ holds test labels and is git-ignored)
 decisions.md           decision log
 ```
@@ -523,8 +576,8 @@ decisions.md           decision log
 - [x] FastAPI service and Locust latency benchmark
 - [x] Docker image (465 MB, CPU only, model mounted rather than baked in)
 - [x] CI: lint, tests, image build and push to the GitHub Container Registry
-- [x] CI evaluation gate (D9): script and job are written; first green run and the blocked-bad-commit proof still to record
-- [ ] SQL analytics and dashboard
+- [x] CI evaluation gate (D9): green in CI; a deliberately bad commit was blocked (by the unit test; the gate itself not yet shown failing)
+- [x] SQL analytics and dashboard (replayed dev data, 8 saved queries, Streamlit)
 - [ ] Kubernetes (kind), deployment, drift monitoring (simulated shift plus the real Facebook-to-Twitter shift)
 - [ ] Explainability and calibration
 - [ ] Benchmark against a decision-model contender and an LLM
