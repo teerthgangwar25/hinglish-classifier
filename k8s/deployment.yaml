@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hinglish-classifier
+  labels:
+    app: hinglish-classifier
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hinglish-classifier
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0          # never drop below 2 ready Pods during an update
+      maxSurge: 1                # start one extra Pod first, then retire an old one
+  template:
+    metadata:
+      labels:
+        app: hinglish-classifier
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001         # the "app" user from the Dockerfile
+      containers:
+        - name: api
+          image: hinglish-classifier:dev
+          imagePullPolicy: IfNotPresent   # the image was loaded into kind, there is no registry to pull from
+          ports:
+            - containerPort: 8000
+          env:
+            - name: MODEL_DIR
+              value: /models
+            - name: LOG_DB
+              value: /data/predictions.db
+            - name: ORT_THREADS
+              value: "2"         # match the CPU limit, or the Pod gets throttled
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 3Gi
+          startupProbe:          # gives the model time to load; the other probes wait for it
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 5
+            failureThreshold: 24         # 24 x 5 s = up to 120 s
+          readinessProbe:       # controls traffic: fail = removed from the Service, not restarted
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:        # controls restarts: fail = container is killed and recreated
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: models
+          hostPath:
+            path: /models        # the folder kind-config.yaml shared into the node
+            type: Directory
+        - name: data
+          emptyDir: {}           # scratch space for the prediction log; deleted with the Pod
