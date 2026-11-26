@@ -2,7 +2,7 @@
 
 > **Content warning:** this project uses a dataset that contains abusive text. No raw examples are shown anywhere in this repository.
 
-**Status: model development, evaluation, EDA, the serving API with its load test, the Docker image, CI (lint, tests, D9 smoke gate, image build and push) and the SQL analytics layer with its dashboard are finished; Kubernetes, drift monitoring and the later layers are next.** The two test sets were scored **once**, on 2026-11-11, after every choice (model, learning rate, threshold, configuration) had been frozen on dev. Sections marked *pending* are not done yet.
+**Status: model development, evaluation, EDA, the serving API with its load test, the Docker image, CI (lint, tests, D9 smoke gate, image build and push) and the SQL analytics layer with its dashboard and a local Kubernetes deployment are finished; drift monitoring and the later layers are next.** The two test sets were scored **once**, on 2026-11-11, after every choice (model, learning rate, threshold, configuration) had been frozen on dev. Sections marked *pending* are not done yet.
 
 ## Summary
 
@@ -398,6 +398,50 @@ Limits, stated plainly:
 - The plan's "most frequent terms per class" and "clusters by language mix" are not possible: the log has no text and no language-mix column, by design (licence, abusive content). Slices by script and length replace them.
 - The script slice here is measured on the comment body (595 Devanagari and 83 mixed comments), so it differs from the older dev error analysis (559 and 119), which counted the letters of `[URL]`, `[USER]` and Latin hashtags as Latin.
 
+## Kubernetes (kind, local)
+
+The serving image runs in a local Kubernetes cluster made with **kind** (Kubernetes inside Docker). Decision D10: **no public hosting**. A free public host would have meant either a paid plan, a card on file, or a cold start with a 712 MB model, so the deployment is local and documented instead. The manifests are in `k8s/`.
+
+| File | What it is |
+| --- | --- |
+| `k8s/kind-config.yaml` | One-node cluster that shares the `serving/model` folder into the node at `/models` (kind's version of `docker run -v`) |
+| `k8s/deployment.yaml` | 2 replicas of `hinglish-classifier:dev`, rolling updates, probes, resource limits |
+| `k8s/service.yaml` | A stable in-cluster address in front of whichever Pods are Ready |
+
+Key settings and why:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| Replicas | 2 | One can die without the service going away |
+| Rolling update | `maxUnavailable: 0`, `maxSurge: 1` | A new Pod must be Ready before an old one is retired |
+| Startup probe | `/health`, every 5 s, up to 24 failures (120 s) | The model loads at startup; this stops the liveness probe from restarting a Pod that is only still loading |
+| Readiness probe | `/health`, every 10 s | A failing Pod is taken out of the Service but not restarted |
+| Liveness probe | `/health`, every 20 s | A stuck Pod is killed and recreated |
+| Resources | request 500m CPU and 1 GiB; limit 2 CPU and 3 GiB | Server memory is about 850 MB after warm-up and reached 2.8 GB in the load test at batch 32 with 16 users |
+| `ORT_THREADS` | 2 | Matches the CPU limit, so ONNX Runtime does not get throttled |
+| User | uid 10001, `runAsNonRoot` | Matches the non-root user in the Dockerfile |
+| Model | read-only `hostPath` volume at `/models` | The model stays out of the image and out of git |
+| Prediction log | `emptyDir` at `/data` | Scratch space; it is deleted with the Pod |
+
+Run it (Windows PowerShell, Docker Desktop running):
+
+```powershell
+kind create cluster --config k8s/kind-config.yaml
+kind load docker-image hinglish-classifier:dev --name hinglish    # kind cannot see local images until they are loaded
+kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml
+kubectl rollout status deployment/hinglish-classifier
+kubectl port-forward service/hinglish-classifier 8080:8000        # then http://localhost:8080/docs
+```
+
+What was demonstrated on the laptop:
+
+- **Deploy.** Both Pods reached `1/1 Running` about 12 s after `kubectl apply` (the model loads in about 11 s), the rollout completed, and `/predict` and `/version` answered through the port-forward with the registered model version.
+- **Self-healing.** I deleted one Pod. The Deployment created a replacement within 2 s and it was Ready after 12 s; the other Pod stayed `1/1 Running` throughout.
+- **Bad release and rollback.** I pointed the Deployment at an image tag that does not exist. It started one new Pod and left both old Pods running, because of `maxUnavailable: 0`. `kubectl rollout undo` removed the broken Pod and the two original Pods were still `1/1 Running`.
+- **Gotcha.** `kubectl rollout undo` switches to the *previous* revision, so running it twice re-deploys the bad one. Naming the image explicitly (`kubectl set image ... api=hinglish-classifier:dev`) is safer.
+
+Not demonstrated: a readiness-probe failure on purpose, and traffic during the rollback (I did not send requests while the bad Pod was starting).
+
 ## Limitations
 
 - The data measures aggression, not "offensive" in a product sense, and comes from 2018 Facebook/Twitter pages with a heavily inflated aggressive share. Precision in real traffic would look different.
@@ -418,6 +462,10 @@ Limits, stated plainly:
 - The smoke gate uses 300 comments, 51 of them non-aggressive, so its macro-F1 limit is deliberately loose. Its latency limit comes from a laptop measurement and needs recalibrating on the CI runner.
 - The smoke gate has never been shown failing on its own: the one bad-commit proof was stopped earlier, by the unit test.
 - The Layer B log is replayed dev data with random timestamps, so its time patterns and latencies say nothing about real traffic.
+- **Not publicly hosted** (D10): the Kubernetes deployment runs on one laptop. kind has a single node, so the two replicas share the same CPU; this shows healing, probes and rollback, not real scaling.
+- `kind-config.yaml` contains a hard-coded Windows path to the model folder; anyone else has to edit it.
+- The prediction log in the cluster lives in an `emptyDir` and disappears with the Pod. A real deployment would need a persistent volume, and the log salt would need to come from a Secret (the default `change-me` is used here).
+- The image is `hinglish-classifier:dev`, loaded into kind by hand. CI pushes a tagged image to the GitHub Container Registry, but the cluster does not pull it.
 - The CI gate depends on a private Hugging Face repo, so others cannot reproduce it without building their own copy of the model bundle and smoke set (`src/make_smoke_set.py`, `src/upload_ci_assets.py`).
 
 ## Reproduce (Windows PowerShell)
@@ -485,6 +533,11 @@ python src/analytics/add_feedback.py                 # true dev labels, keyed by
 python src/analytics/run_queries.py                  # writes reports\sql\*.md
 pip install streamlit
 streamlit run src/analytics/dashboard.py             # http://localhost:8501
+
+# Kubernetes (kind): see the Kubernetes section; edit the model path in k8s/kind-config.yaml first
+kind create cluster --config k8s/kind-config.yaml
+kind load docker-image hinglish-classifier:dev --name hinglish
+kubectl apply -f k8s/deployment.yaml -f k8s/service.yaml
 ```
 
 Tests: `python -m pytest -q`
@@ -549,6 +602,7 @@ src/
   analytics/           replay.py, add_feedback.py, run_queries.py, dashboard.py (Layer B)
 run_ablations.ps1      chunked runner for the ablation experiments
 sql/                   eight saved queries on the prediction log (Layer B)
+k8s/                   kind config, Deployment and Service manifests
 docker/Dockerfile      CPU-only serving image
 requirements-serve.txt pinned runtime dependencies for the API
 .github/workflows/ci.yml   lint, tests, smoke gate, image build and push
@@ -578,7 +632,8 @@ decisions.md           decision log
 - [x] CI: lint, tests, image build and push to the GitHub Container Registry
 - [x] CI evaluation gate (D9): green in CI; a deliberately bad commit was blocked (by the unit test; the gate itself not yet shown failing)
 - [x] SQL analytics and dashboard (replayed dev data, 8 saved queries, Streamlit)
-- [ ] Kubernetes (kind), deployment, drift monitoring (simulated shift plus the real Facebook-to-Twitter shift)
+- [x] Kubernetes (kind): Deployment, Service, probes, resource limits; self-healing and rollback shown locally (no public hosting, D10)
+- [ ] Drift monitoring (simulated shift plus the real Facebook-to-Twitter shift)
 - [ ] Explainability and calibration
 - [ ] Benchmark against a decision-model contender and an LLM
 
