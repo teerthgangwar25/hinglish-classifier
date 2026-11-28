@@ -442,6 +442,28 @@ What was demonstrated on the laptop:
 
 Not demonstrated: a readiness-probe failure on purpose, and traffic during the rollback (I did not send requests while the bad Pod was starting).
 
+## Upcoming (planned, not built)
+
+Nothing in this section exists yet. It is listed so the scope of the finished work is clear.
+
+**Drift monitoring (Phase 7).** There is no real traffic, so any shift would be simulated, apart from the real Facebook-to-Twitter shift already shown in the EDA.
+- Signals computed from the prediction log (flag rate, script, length, hashtag share) and from text (unseen-word rate against the training vocabulary).
+- Three comparisons: dev vs another dev slice (the detector must stay quiet), a deliberately shifted dev slice, and Facebook vs Twitter inputs. Inputs only, no test labels.
+- A review rule written before running, and a manual workflow that produces a drift report. Retraining stays a local, human-approved step that registers a challenger, never the champion.
+- Data drift can be seen without labels; concept drift cannot.
+
+**Explainability and calibration (Layer C).** Token-level explanations on model errors, a reliability diagram with expected calibration error, and temperature scaling fitted on dev.
+
+**Decision-model and LLM benchmark (Layer D).** A four-way comparison (TF-IDF, fine-tuned HingBERT, a decision-model contender, an LLM) with a protocol and adoption rule fixed before running.
+
+**Smaller open items**
+- Rewrite one model with a hand-written training loop.
+- Show the smoke gate itself failing (a bug inside the model path).
+- Record the CI runner's p95 latency and recalibrate the gate limit.
+- Re-test length bucketing on a machine that does not throttle.
+- Make the cluster pull the GHCR image instead of a hand-loaded one, and move the log salt into a Secret.
+- Choose a code licence.
+  
 ## Limitations
 
 - The data measures aggression, not "offensive" in a product sense, and comes from 2018 Facebook/Twitter pages with a heavily inflated aggressive share. Precision in real traffic would look different.
@@ -641,4 +663,4 @@ decisions.md           decision log
 
 The dataset is CC-BY-NC-SA 4.0 (non-commercial, share-alike) and is not redistributed here, and the test labels are kept out of the repo. Please cite the dataset as requested on the shared-task page: https://sites.google.com/view/trac1/shared-task
 
-*Code licence: to be chosen.*
+*Code licence: MIT,Apache-2.0.*
